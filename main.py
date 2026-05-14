@@ -2,6 +2,7 @@ import duckdb
 import logging
 import sys
 from datetime import datetime, timedelta
+import os  # ДОБАВИТЬ ЭТУ СТРОКУ (для проверки файлов)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,9 +15,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def main():
-    logger.info("=" * 60)
+
     logger.info("ЗАПУСК ETL ПРОЦЕССА")
-    logger.info("=" * 60)
+    logger.info("\n")
+
     
     conn = duckdb.connect('dwh.duckdb')
     
@@ -203,8 +205,8 @@ def main():
         logger.info(f"   Всего факт: {stats[2]:,.0f}")
         logger.info(f"   Всего план: {stats[3]:,.0f}")
         
-        # Пример данных
-        logger.info("\n📋 Пример данных из витрины (первые 10 строк):")
+        # Пример
+        logger.info("\n Пример данных из витрины (первые 10 строк):")
         sample = conn.execute("""
             SELECT date, region, chain_id, product_group, actual_qty, plan_qty, delta, completion_pct
             FROM mart_sales_plan_daily 
@@ -228,9 +230,195 @@ def main():
         dup_docs = conn.execute("SELECT COUNT(*) FROM (SELECT doc_id FROM raw_sales_1c GROUP BY doc_id HAVING COUNT(*) > 1)").fetchone()[0]
         logger.info(f"   Дубли документов в raw: {dup_docs} (исключены из витрины)")
         
-        logger.info("\n" + "=" * 60)
-        logger.info("ETL ПРОЦЕСС ЗАВЕРШЕН!")
-        logger.info("=" * 60)
+
+        # ЗАДАНИЯ СО ЗВЕЗДОЧКОЙ
+        logger.info("-" * 20)
+        logger.info("ЗАДАНИЯ СО ЗВЕЗДОЧКОЙ")
+        logger.info("-" * 20)
+        
+        # 1. Последняя операция клиента
+        logger.info("\n 1. Последняя операция клиента...")
+        
+        conn.execute("""
+            CREATE OR REPLACE TABLE mart_last_customer_operation AS
+            WITH ranked AS (
+                SELECT 
+                    customer_id,
+                    doc_id as last_doc_id,
+                    date as last_date,
+                    sku_id as last_sku_id,
+                    qty as last_qty,
+                    revenue_byn as last_revenue_byn,
+                    ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY date DESC, doc_id DESC) as rn
+                FROM stg_sales
+            )
+            SELECT 
+                customer_id,
+                last_doc_id,
+                last_date,
+                last_sku_id,
+                last_qty,
+                last_revenue_byn
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY customer_id
+        """)
+        
+        last_op_count = conn.execute("SELECT COUNT(*) FROM mart_last_customer_operation").fetchone()[0]
+        logger.info(f"   Создано {last_op_count} записей (последняя операция для каждого клиента)")
+        
+        # 2. Rolling 7-day metric (скользящая сумма)
+        logger.info("\n 2. Rolling 7-day metric...")
+        
+        conn.execute("""
+            CREATE OR REPLACE TABLE mart_rolling_7d AS
+            SELECT 
+                date,
+                region,
+                chain_name,
+                product_group,
+                actual_qty,
+                SUM(actual_qty) OVER (
+                    PARTITION BY region, chain_name, product_group 
+                    ORDER BY date 
+                    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+                ) as rolling_7d_actual_qty
+            FROM sales_daily
+            ORDER BY region, chain_name, product_group, date
+        """)
+        
+        rolling_count = conn.execute("SELECT COUNT(*) FROM mart_rolling_7d").fetchone()[0]
+        logger.info(f"   Создано {rolling_count} записей (скользящая сумма за 7 дней)")
+        
+        # 3. Month-to-date metric (накопление с начала месяца)
+        logger.info("\n 3. Month-to-date metric...")
+        
+        conn.execute("""
+            CREATE OR REPLACE TABLE mart_mtd AS
+            SELECT 
+                date,
+                region,
+                chain_name,
+                product_group,
+                actual_qty,
+                SUM(actual_qty) OVER (
+                    PARTITION BY region, chain_name, product_group, DATE_TRUNC('month', date)
+                    ORDER BY date 
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) as mtd_actual_qty
+            FROM sales_daily
+            ORDER BY region, chain_name, product_group, date
+        """)
+        
+        mtd_count = conn.execute("SELECT COUNT(*) FROM mart_mtd").fetchone()[0]
+        logger.info(f"   Создано {mtd_count} записей (накопление с начала месяца)")
+        
+        # 4. Остаток на складе в BYN по дням
+        logger.info("\n 4. Остаток на складе...")
+        
+        if os.path.exists('data/stock_movements_optional.csv'):
+            #raw данные
+            conn.execute("""
+                CREATE OR REPLACE TABLE raw_stock_movements AS 
+                SELECT * FROM read_csv_auto('data/stock_movements_optional.csv')
+            """)
+            
+            # Staging слой
+            conn.execute("""
+                CREATE OR REPLACE TABLE stg_stock_movements AS
+                SELECT 
+                    CAST(date AS DATE) as date,
+                    TRIM(warehouse_id) as warehouse_id,
+                    TRIM(warehouse_name) as warehouse_name,
+                    TRIM(sku_id) as sku_id,
+                    TRIM(operation_type) as operation_type,
+                    CAST(qty AS DECIMAL(12,2)) as qty,
+                    CAST(unit_cost_byn AS DECIMAL(12,2)) as unit_cost_byn
+                FROM raw_stock_movements
+            """)
+            
+            # Расчет остатка накопительно
+            conn.execute("""
+                CREATE OR REPLACE TABLE mart_stock_daily AS
+                WITH stock_changes AS (
+                    SELECT 
+                        date,
+                        warehouse_id,
+                        warehouse_name,
+                        sku_id,
+                        CASE 
+                            WHEN operation_type = 'income' THEN qty
+                            WHEN operation_type = 'outcome' THEN -qty
+                            ELSE 0
+                        END as stock_change,
+                        unit_cost_byn
+                    FROM stg_stock_movements
+                ),
+                cumulative AS (
+                    SELECT 
+                        date,
+                        warehouse_id,
+                        warehouse_name,
+                        sku_id,
+                        SUM(stock_change) OVER (
+                            PARTITION BY warehouse_id, sku_id 
+                            ORDER BY date 
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) as stock_qty,
+                        unit_cost_byn
+                    FROM stock_changes
+                )
+                SELECT 
+                    date,
+                    warehouse_id,
+                    warehouse_name,
+                    sku_id,
+                    stock_qty,
+                    ROUND(stock_qty * unit_cost_byn, 2) as stock_value_byn
+                FROM cumulative
+                WHERE stock_qty != 0
+                ORDER BY warehouse_id, sku_id, date
+            """)
+            
+            stock_count = conn.execute("SELECT COUNT(*) FROM mart_stock_daily").fetchone()[0]
+            logger.info(f"   Создано {stock_count} записей (остатки на складах)")
+            
+            # Пример
+            stock_sample = conn.execute("SELECT * FROM mart_stock_daily LIMIT 5").fetchdf()
+            if len(stock_sample) > 0:
+                logger.info("   Пример остатков на складах:")
+                print(stock_sample.to_string(index=False))
+        else:
+            logger.warning("   Файл stock_movements_optional.csv не найден, пропускаем")
+        
+        # Вывод примеров заданий со звездочкой
+        logger.info("\n Примеры результатов заданий со звездочкой:")
+        
+        # Пример последних операций
+        sample_last = conn.execute("SELECT * FROM mart_last_customer_operation LIMIT 5").fetchdf()
+        if len(sample_last) > 0:
+            logger.info("\n   Последняя операция клиента (первые 5):")
+            print(sample_last.to_string(index=False))
+        
+        # Пример скользящей суммы
+        sample_rolling = conn.execute("""
+            SELECT * FROM mart_rolling_7d 
+            WHERE region = 'Минск' LIMIT 5
+        """).fetchdf()
+        if len(sample_rolling) > 0:
+            logger.info("\n   Rolling 7-day (первые 5 для Минск):")
+            print(sample_rolling.to_string(index=False))
+        
+        # Пример MTD
+        sample_mtd = conn.execute("""
+            SELECT * FROM mart_mtd 
+            WHERE region = 'Минск' LIMIT 5
+        """).fetchdf()
+        if len(sample_mtd) > 0:
+            logger.info("\n   Month-to-date (первые 5 для Минск):")
+            print(sample_mtd.to_string(index=False))
+
+        logger.info(" ETL ПРОЦЕСС ЗАВЕРШЕН!")
         
     except Exception as e:
         logger.error(f" Ошибка: {e}")
