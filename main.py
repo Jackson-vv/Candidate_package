@@ -102,16 +102,37 @@ def main():
         for plan in plans:
             chain_id, region, product_group, plan_month, plan_qty, mw, tw, ww, thw, fw, saw, suw = plan
             
-            total_weight = float(mw) + float(tw) + float(ww) + float(thw) + float(fw) + float(saw) + float(suw)
-            
-            # Первый и последний день месяца
+            # Сначала считаем сумму весов всех дней в этом месяце
             first_day = plan_month
             if plan_month.month == 12:
                 last_day = plan_month.replace(year=plan_month.year+1, month=1, day=1) - timedelta(days=1)
             else:
                 last_day = plan_month.replace(month=plan_month.month+1, day=1) - timedelta(days=1)
             
+            day_weights = []
             current = first_day
+            while current <= last_day:
+                dow = current.weekday()
+                if dow == 0:
+                    day_weights.append(float(mw))
+                elif dow == 1:
+                    day_weights.append(float(tw))
+                elif dow == 2:
+                    day_weights.append(float(ww))
+                elif dow == 3:
+                    day_weights.append(float(thw))
+                elif dow == 4:
+                    day_weights.append(float(fw))
+                elif dow == 5:
+                    day_weights.append(float(saw))
+                else:
+                    day_weights.append(float(suw))
+                current += timedelta(days=1)
+            
+            total_month_weight = sum(day_weights)
+            
+            current = first_day
+            idx = 0
             while current <= last_day:
                 dow = current.weekday()
                 if dow == 0:
@@ -129,7 +150,7 @@ def main():
                 else:
                     day_weight = float(suw)
                 
-                daily_plan = plan_qty * (day_weight / total_weight)
+                daily_plan = plan_qty * (day_weight / total_month_weight)
                 
                 conn.execute(
                     "INSERT INTO stg_plan_daily VALUES (?, ?, ?, ?, ?)",
